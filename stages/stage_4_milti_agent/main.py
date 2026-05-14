@@ -114,8 +114,10 @@ class LegalState(TypedDict):
     law_analysis: str
     needs_tax: bool
     needs_compliance: bool
+    needs_privacy: bool
     tax_result: Annotated[str, _last_wins]
     compliance_result: Annotated[str, _last_wins]
+    privacy_result: Annotated[str, _last_wins]
     final_answer: str
 
 
@@ -171,11 +173,15 @@ async def check_routing(state: LegalState) -> dict:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         parsed = {"needs_tax": True, "needs_compliance": True}
-
     needs_tax = bool(parsed.get("needs_tax", True))
     needs_compliance = bool(parsed.get("needs_compliance", True))
+    # Also detect privacy-related keywords as an additional safety-net
+    needs_privacy = bool(parsed.get("needs_privacy", False)) or any(
+        kw in state["question"].lower() for kw in ["data", "privacy", "gdpr", "dữ liệu"]
+    )
     print(f"  [Node: check_routing] needs_tax={needs_tax}, needs_compliance={needs_compliance}")
-    return {"needs_tax": needs_tax, "needs_compliance": needs_compliance}
+    print(f"  [Node: check_routing] needs_privacy={needs_privacy}")
+    return {"needs_tax": needs_tax, "needs_compliance": needs_compliance, "needs_privacy": needs_privacy}
 
 
 def route_to_specialists(state: LegalState) -> list[Send]:
@@ -185,6 +191,8 @@ def route_to_specialists(state: LegalState) -> list[Send]:
         sends.append(Send("call_tax_specialist", state))
     if state.get("needs_compliance"):
         sends.append(Send("call_compliance_specialist", state))
+    if state.get("needs_privacy"):
+        sends.append(Send("call_privacy_specialist", state))
     if not sends:
         sends.append(Send("aggregate", state))
     return sends
@@ -235,6 +243,27 @@ async def call_compliance_specialist(state: LegalState) -> dict:
     return {"compliance_result": final_msg}
 
 
+async def call_privacy_specialist(state: LegalState) -> dict:
+    """Privacy specialist sub-agent (runs as inline ReAct agent)."""
+    from langgraph.prebuilt import create_react_agent
+
+    print("\n  [Node: call_privacy_specialist] Privacy specialist agent starting...")
+
+    privacy_prompt = (
+        "You are a privacy law specialist with expertise in GDPR, CCPA, data breach response, "
+        "and cross-border data transfer rules. Use the search_compliance_law tool to ground your analysis. "
+        "Keep your response under 200 words."
+    )
+
+    llm = get_llm()
+    agent = create_react_agent(model=llm, tools=[search_compliance_law], prompt=privacy_prompt)
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": state["question"]}]})
+
+    final_msg = result["messages"][-1].content
+    print(f"  [Node: call_privacy_specialist] Done ({len(final_msg)} chars)")
+    return {"privacy_result": final_msg}
+
+
 async def aggregate(state: LegalState) -> dict:
     """Combine all specialist analyses into a final comprehensive answer."""
     print("\n  [Node: aggregate] Combining all specialist analyses...")
@@ -278,6 +307,7 @@ def create_graph():
     graph.add_node("check_routing", check_routing)
     graph.add_node("call_tax_specialist", call_tax_specialist)
     graph.add_node("call_compliance_specialist", call_compliance_specialist)
+    graph.add_node("call_privacy_specialist", call_privacy_specialist)
     graph.add_node("aggregate", aggregate)
 
     graph.set_entry_point("analyze_law")
